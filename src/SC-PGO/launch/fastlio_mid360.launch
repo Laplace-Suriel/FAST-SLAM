@@ -1,0 +1,55 @@
+<launch>
+
+    <param name="scan_line" type="int" value="4" />
+
+    <!-- remove too closed points -->
+    <param name="minimum_range" type="double" value="0.5"/>
+
+    <param name="mapping_line_resolution" type="double" value="0.4"/> <!-- A-LOAM -->
+    <param name="mapping_plane_resolution" type="double" value="0.8"/> <!-- A-LOAM -->
+
+    <param name="mapviz_filter_size" type="double" value="0.05"/>
+
+    <!-- SC-A-LOAM -->
+    <param name="keyframe_meter_gap" type="double" value="0.5"/>
+
+    <!-- Scan Context -->
+    <param name="sc_dist_thres" type="double" value="0.3"/> <!-- if want fewer outliers, use 0.1-0.15 -->
+    <param name="sc_max_radius" type="double" value="80.0"/> <!-- lower values (20, 40) for indoor -->
+    <arg name="elevator_floor_height" default="3.0" />
+    <arg name="elevator_current_floor" default="0" />
+    <arg name="elevator_target_floor" default="1" />
+    <param name="elevator_floor_height" type="double" value="$(arg elevator_floor_height)"/>
+    <param name="elevator_current_floor" type="int" value="$(arg elevator_current_floor)"/>
+    <param name="elevator_target_floor" type="int" value="$(arg elevator_target_floor)"/>
+
+    <!-- LiDAR extrinsic for body cloud to odom alignment (same keys as FAST-LIVO2 yaml) -->
+    <param name="use_lidar_extrinsic" type="bool" value="true"/>
+    <rosparam param="extrin_calib/extrinsic_T">[0.04165, 0.02326, -0.0284]</rosparam>
+    <rosparam param="extrin_calib/extrinsic_R">[1, 0, 0, 0, 1, 0, 0, 0, 1]</rosparam>
+
+    <!-- for Livox Mid-360 -->
+    <param name="lidar_type" type="string" value="MID360"/>
+
+    <!-- input from FAST-LIO2 frontend -->
+    <remap from="/aft_mapped_to_init" to="/Odometry"/>
+    <remap from="/velodyne_cloud_registered_local" to="/cloud_registered_body"/>
+
+    <!-- optional GPS input for altitude factor -->
+    <!-- <remap from="/gps/fix" to="/your_gps_topic"/> -->
+
+    <!-- utils -->
+    <param name="save_directory" type="string" value="$(env PWD)/PCD/"/>  <!-- save into PCD under current working directory -->
+
+    <!-- nodes -->
+    <node pkg="aloam_velodyne" type="alaserPGO" name="alaserPGO" output="screen">
+      <env name="LD_PRELOAD" value="/usr/lib/x86_64-linux-gnu/libasan.so.5"/>
+      <env name="ASAN_OPTIONS" value="halt_on_error=1:abort_on_error=1:disable_coredump=0:detect_leaks=0"/>
+    </node>
+    <!-- visualization -->
+    <arg name="rvizscpgo" default="true" />
+    <group if="$(arg rvizscpgo)">
+        <node launch-prefix="nice" pkg="rviz" type="rviz" name="rvizscpgo" args="-d $(find aloam_velodyne)/rviz_cfg/aloam_velodyne.rviz" />
+    </group>
+
+</launch>
