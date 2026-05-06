@@ -16,16 +16,10 @@
     <!-- Scan Context -->
     <param name="sc_dist_thres" type="double" value="0.15"/> <!-- if want fewer outliers, use 0.1-0.15 -->
     <param name="sc_max_radius" type="double" value="80.0"/> <!-- lower values (20, 40) for indoor -->
-    <param name="loop_fitness_score_threshold" type="double" value="1"/> <!-- ICP fitness score threshold for loop closure -->
+    <param name="loop_fitness_score_threshold" type="double" value="0.8"/> <!-- ICP fitness score threshold for loop closure -->
     <param name="use_kf_gravity_align_for_sc" type="bool" value="true"/>
     <param name="kf_gravity_topic" type="string" value="/kf_gravity"/>
-    <param name="gravity_sync_threshold_sec" type="double" value="0.10"/>
-    <arg name="elevator_floor_height" default="3.0" />
-    <arg name="elevator_current_floor" default="3" />
-    <arg name="elevator_target_floor" default="1" />
-    <param name="elevator_floor_height" type="double" value="$(arg elevator_floor_height)"/>
-    <param name="elevator_current_floor" type="int" value="$(arg elevator_current_floor)"/>
-    <param name="elevator_target_floor" type="int" value="$(arg elevator_target_floor)"/>
+
 
     <!-- LiDAR extrinsic for body cloud to odom alignment (same keys as FAST-LIVO2 yaml) -->
     <param name="use_lidar_extrinsic" type="bool" value="true"/>
@@ -44,8 +38,10 @@
 
     <!-- utils -->
     <param name="save_directory" type="string" value="$(env PWD)/PCD/"/>  <!-- save into PCD under current working directory -->
-    <param name="save_sc_keyframe_to_disk" type="bool" value="true"/>
+    <param name="save_sc_keyframe_to_disk" type="bool" value="false"/>
     <param name="enable_non_elevator_floor_height_tracking" type="bool" value="false"/>
+    <param name="same_session_loop_position_thres" type="double" value="2.0"/>  
+    <param name="save_keyframe_image_to_disk" type="bool" value="true"/>
    
     <!-- nodes -->
     <node pkg="aloam_velodyne" type="alaserPGO" name="alaserPGO" output="screen">

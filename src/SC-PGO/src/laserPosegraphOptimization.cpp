@@ -34,7 +34,6 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/image_encodings.h>
-#include <sensor_msgs/NavSatFix.h>
 #include <geometry_msgs/Vector3Stamped.h>
 #include <cv_bridge/cv_bridge.h>
 #include <tf/transform_datatypes.h>
@@ -57,7 +56,6 @@
 #include <gtsam/geometry/Pose2.h>
 #include <gtsam/slam/PriorFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
-#include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
@@ -86,7 +84,6 @@ Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
 std::queue<sensor_msgs::ImageConstPtr> imageBuf;
-std::queue<sensor_msgs::NavSatFix::ConstPtr> gpsBuf;
 std::queue<geometry_msgs::Vector3Stamped::ConstPtr> kfGravityBuf;
 std::queue<std_msgs::Bool::ConstPtr> elevatorSceneBuf;
 std::queue<std::pair<int, int> > scLoopICPBuf;
@@ -121,36 +118,21 @@ gtsam::Values isamCurrentEstimate;
 noiseModel::Diagonal::shared_ptr priorNoise;
 noiseModel::Diagonal::shared_ptr odomNoise;
 noiseModel::Diagonal::shared_ptr degenerateNoise;
-noiseModel::Base::shared_ptr floorHeightNoise;
 noiseModel::Base::shared_ptr robustLoopNoise;
-noiseModel::Base::shared_ptr robustGPSNoise;
 
 bool latestElevatorScene = false;
 bool hasElevatorSceneMsg = false;
 std::string elevatorSceneTopic = "/lio/elevator_scene";
 std::string imageTopic = "/rgb_img";
 
-bool enableNonElevatorFloorHeightTracking = true;
-double nonElevatorFloorHeightAlpha = 0.1;
-bool hasTrackedFloorHeight = false;
-double trackedFloorHeight = 0.0;
-std::mutex mFloorHeight;
-bool useTrackedFloorHeightFactorInElevator = true;
-double floorHeightFactorSigma = 0.2;
-double elevatorFloorHeight = 3.0;
-int elevatorFloorCount = 1;
-int elevatorCurrentFloor = 0;
-int elevatorTargetFloor = 1;
 bool hasPrevKeyframeElevatorScene = false;
 bool prevKeyframeElevatorScene = false;
-int elevatorEnterNodeIdx = -1;
-Eigen::Vector3d elevatorEnterUpAxis(0.0, 0.0, 1.0);
-bool hasElevatorEnterUpAxis = false;
 
 pcl::VoxelGrid<PointType> downSizeFilterScancontext;
 SCManager scManager;
 double scDistThres, scMaximumRadius;
 double loopFitnessScoreThreshold = 0.3;
+double sameSessionLoopPositionThreshold = 5.0;
 double icpTrimmedOverlapRatio = 0.4;
 
 pcl::VoxelGrid<PointType> downSizeFilterICP;
@@ -164,12 +146,6 @@ pcl::VoxelGrid<PointType> downSizeFilterMapPGO;
 double mapVizLeafSize = 0.4;
 bool laserCloudMapPGORedraw = true;
 
-bool useGPS = false;
-// bool useGPS = false;
-sensor_msgs::NavSatFix::ConstPtr currGPS;
-bool hasGPSforThisKF = false;
-bool gpsOffsetInitialized = false; 
-double gpsAltitudeInitOffset = 0.0;
 double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
 
@@ -188,6 +164,7 @@ std::string pgLoopCloudDirectory;
 std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
 std::fstream loopTimePairSaveStream;
+std::fstream loopCloudFitnessSaveStream;
 std::fstream scDetectAllPairsSaveStream;
 std::fstream keyframeFrameIdSaveStream;
 std::fstream subscribedOdomSaveStream;
@@ -283,15 +260,6 @@ void imageHandler(const sensor_msgs::ImageConstPtr &msg)
     mBuf.unlock();
 }
 
-void gpsHandler(const sensor_msgs::NavSatFix::ConstPtr &_gps)
-{
-    if(useGPS) {
-        mBuf.lock();
-        gpsBuf.push(_gps);
-        mBuf.unlock();
-    }
-} // gpsHandler
-
 void elevatorSceneHandler(const std_msgs::Bool::ConstPtr& msg)
 {
     mBuf.lock();
@@ -323,174 +291,7 @@ bool getLatestKfGravity(Eigen::Vector3d& gravityOut)
     return true;
 }
 
-bool getHeightAlongGravityAxis(const Pose6D& pose, double& heightOut)
-{
-    Eigen::Vector3d gravityVec;
-    if (!getLatestKfGravity(gravityVec)) {
-        return false;
-    }
 
-    const double gNorm = gravityVec.norm();
-    if (gNorm < 1e-6) {
-        return false;
-    }
-
-    const Eigen::Vector3d upAxis = -gravityVec / gNorm;
-    const Eigen::Vector3d position(pose.x, pose.y, pose.z);
-    heightOut = upAxis.dot(position);
-    return true;
-}
-
-bool getCloudHeightSpanAlongGravityAxis(const pcl::PointCloud<PointType>::Ptr& cloud,
-                                        double& heightSpanOut)
-{
-    if (!cloud || cloud->empty()) {
-        return false;
-    }
-
-    Eigen::Vector3d gravityVec;
-    if (!getLatestKfGravity(gravityVec)) {
-        return false;
-    }
-
-    const double gNorm = gravityVec.norm();
-    if (gNorm < 1e-6) {
-        return false;
-    }
-
-    const Eigen::Vector3d upAxis = -gravityVec / gNorm;
-    double minProj = std::numeric_limits<double>::infinity();
-    double maxProj = -std::numeric_limits<double>::infinity();
-
-    for (const auto& point : cloud->points) {
-        const Eigen::Vector3d p(point.x, point.y, point.z);
-        const double projection = upAxis.dot(p);
-        minProj = std::min(minProj, projection);
-        maxProj = std::max(maxProj, projection);
-    }
-
-    if (!std::isfinite(minProj) || !std::isfinite(maxProj)) {
-        return false;
-    }
-
-    heightSpanOut = maxProj - minProj;
-    return true;
-}
-
-bool getCloudHeightSpanAlongZ(const pcl::PointCloud<PointType>::Ptr& cloud,
-                              double& heightSpanOut)
-{
-    if (!cloud || cloud->empty()) {
-        return false;
-    }
-
-    double minZ = std::numeric_limits<double>::infinity();
-    double maxZ = -std::numeric_limits<double>::infinity();
-    for (const auto& point : cloud->points) {
-        minZ = std::min(minZ, static_cast<double>(point.z));
-        maxZ = std::max(maxZ, static_cast<double>(point.z));
-    }
-
-    if (!std::isfinite(minZ) || !std::isfinite(maxZ)) {
-        return false;
-    }
-
-    heightSpanOut = maxZ - minZ;
-    return true;
-}
-
-void updateTrackedFloorHeight(const double zMeasurement)
-{
-    std::lock_guard<std::mutex> lock(mFloorHeight);
-    if (!hasTrackedFloorHeight) {
-        trackedFloorHeight = zMeasurement;
-        hasTrackedFloorHeight = true;
-        return;
-    }
-
-    trackedFloorHeight = (1.0 - nonElevatorFloorHeightAlpha) * trackedFloorHeight
-                      + nonElevatorFloorHeightAlpha * zMeasurement;
-}
-
-bool getTrackedFloorHeight(double& zOut)
-{
-    std::lock_guard<std::mutex> lock(mFloorHeight);
-    if (!hasTrackedFloorHeight) {
-        return false;
-    }
-
-    zOut = trackedFloorHeight;
-    return true;
-}
-
-class GravityAxisHeightFactor : public gtsam::NoiseModelFactor1<gtsam::Pose3>
-{
-public:
-    GravityAxisHeightFactor(gtsam::Key key,
-                            const Eigen::Vector3d& upAxis,
-                            const double targetHeight,
-                            const gtsam::noiseModel::Base::shared_ptr& model)
-        : gtsam::NoiseModelFactor1<gtsam::Pose3>(model, key), upAxis_(upAxis), targetHeight_(targetHeight) {}
-
-    gtsam::Vector evaluateError(const gtsam::Pose3& pose,
-                                gtsam::OptionalMatrixType H = nullptr) const override
-    {
-        const Eigen::Vector3d position = pose.translation();
-        gtsam::Vector1 error;
-        error << upAxis_.dot(position) - targetHeight_;
-
-        if (H) {
-            H->setZero(1, 6);
-            H->block<1, 3>(0, 3) = upAxis_.transpose();
-        }
-
-        return error;
-    }
-
-private:
-    Eigen::Vector3d upAxis_;
-    double targetHeight_;
-};
-
-class GravityAxisHeightDifferenceFactor : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>
-{
-public:
-    GravityAxisHeightDifferenceFactor(gtsam::Key keyFrom,
-                                      gtsam::Key keyTo,
-                                      const Eigen::Vector3d& upAxis,
-                                      const double targetHeightDelta,
-                                      const gtsam::noiseModel::Base::shared_ptr& model)
-        : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(model, keyFrom, keyTo),
-          upAxis_(upAxis),
-          targetHeightDelta_(targetHeightDelta) {}
-
-    gtsam::Vector evaluateError(const gtsam::Pose3& poseFrom,
-                                const gtsam::Pose3& poseTo,
-                                gtsam::OptionalMatrixType H1 = nullptr,
-                                gtsam::OptionalMatrixType H2 = nullptr) const override
-    {
-        const Eigen::Vector3d positionFrom = poseFrom.translation();
-        const Eigen::Vector3d positionTo = poseTo.translation();
-        gtsam::Vector1 error;
-        error << upAxis_.dot(positionTo - positionFrom) - targetHeightDelta_;
-
-        if (H1) {
-            H1->setZero(1, 6);
-            H1->block<1, 3>(0, 3) = -upAxis_.transpose();
-        }
-
-        if (H2) {
-            H2->setZero(1, 6);
-            H2->block<1, 3>(0, 3) = upAxis_.transpose();
-        }
-
-        return error;
-    }
-
-private:
-    Eigen::Vector3d upAxis_;
-    double targetHeightDelta_;
-};
 
 void alignPointCloudToGravityZ(const Eigen::Vector3d& gravityVec, pcl::PointCloud<PointType>::Ptr& cloud)
 {
@@ -535,8 +336,6 @@ void initNoises( void )
     degenerateNoiseVector6 << 1e-4, 1e-4, 1e-4, 1e-2, 1e-2, 1e-2;
     degenerateNoise = noiseModel::Diagonal::Variances(degenerateNoiseVector6);
 
-    floorHeightNoise = gtsam::noiseModel::Isotropic::Sigma(1, floorHeightFactorSigma);
-
     /* double loopNoiseScore = 0.5; // constant is ok...
     gtsam::Vector robustNoiseVector6(6); // gtsam::Pose3 factor has 6 elements (6D)
     robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore;
@@ -546,14 +345,6 @@ void initNoises( void )
     gtsam::Vector loopNoiseVector6(6);
     loopNoiseVector6 << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6;
     robustLoopNoise = noiseModel::Diagonal::Variances(loopNoiseVector6);
-
-    double bigNoiseTolerentToXY = 1000000000.0; // 1e9
-    double gpsAltitudeNoiseScore = 250.0; // if height is misaligned after loop clsosing, use this value bigger
-    gtsam::Vector robustNoiseVector3(3); // gps factor has 3 elements (xyz)
-    robustNoiseVector3 << bigNoiseTolerentToXY, bigNoiseTolerentToXY, gpsAltitudeNoiseScore; // means only caring altitude here. (because LOAM-like-methods tends to be asymptotically flyging)
-    robustGPSNoise = gtsam::noiseModel::Robust::Create(
-                    gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
-                    gtsam::noiseModel::Diagonal::Variances(robustNoiseVector3) );
 
 } // initNoises
 
@@ -983,6 +774,14 @@ std::optional<LoopIcpResult> doICPVirtualRelative( int _loop_kf_idx, int _curr_k
     icp.align(*unused_result, initialGuess);
  
     const double fitnessScore = icp.getFitnessScore();
+
+    if (loopCloudFitnessSaveStream.is_open()) {
+        loopCloudFitnessSaveStream << _loop_kf_idx << " "
+                                   << _curr_kf_idx << " "
+                                   << std::fixed << std::setprecision(6)
+                                   << fitnessScore << std::endl;
+    }
+    
     if (icp.hasConverged() == false || fitnessScore > loopFitnessScoreThreshold) {
         std::cout << "[SC loop] ICP fitness test failed (" << fitnessScore << " > " << loopFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
         return std::nullopt;
@@ -1039,29 +838,6 @@ void process_pg()
                 // Fallback to latest state if the queue is temporarily empty.
                 elevatorSceneThisFrame = latestElevatorScene;
             }
-            double currentFloorHeight = 0.0;
-            bool useGravityAxisHeightForLog = false;
-            if (enableNonElevatorFloorHeightTracking) {
-                if (getCloudHeightSpanAlongGravityAxis(thisKeyFrame, currentFloorHeight)) {
-                    useGravityAxisHeightForLog = true;
-                } else {
-                    getCloudHeightSpanAlongZ(thisKeyFrame, currentFloorHeight);
-                }
-                ROS_INFO_STREAM_THROTTLE(1.0,
-                                         "[SC-PGO] current cloud height span=" << currentFloorHeight
-                                         << (useGravityAxisHeightForLog ? " (gravity-axis max-min)" : " (z-axis max-min fallback)"));
-            }
-
-            if (enableNonElevatorFloorHeightTracking && !elevatorSceneThisFrame) {
-                double gravityAxisHeight = 0.0;
-                if (getHeightAlongGravityAxis(pose_curr, gravityAxisHeight)) {
-                    updateTrackedFloorHeight(gravityAxisHeight);
-                } else {
-                    // Fallback when gravity is unavailable: keep legacy z-based tracking.
-                    updateTrackedFloorHeight(pose_curr.z);
-                }
-            }
-
             // Determine elevator session transitions for this keyframe
             bool isElevatorEnterTransition = false;
             bool isElevatorExitTransition = false;
@@ -1107,20 +883,6 @@ void process_pg()
                 hasImageForFrame = true;
             }
 
-            // find nearest gps 
-            double eps = 0.1; // find a gps topioc arrived within eps second 
-            while (!gpsBuf.empty()) {
-                auto thisGPS = gpsBuf.front();
-                auto thisGPSTime = thisGPS->header.stamp.toSec();
-                if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
-                    currGPS = thisGPS;
-                    hasGPSforThisKF = true; 
-                    break;
-                } else {
-                    hasGPSforThisKF = false;
-                }
-                gpsBuf.pop();
-            }
             mBuf.unlock(); 
 
             //
@@ -1144,13 +906,6 @@ void process_pg()
 
             if( ! isNowKeyFrame ) 
                 continue; 
-
-            if( !gpsOffsetInitialized ) {
-                if(hasGPSforThisKF) { // if the very first frame 
-                    gpsAltitudeInitOffset = currGPS->altitude;
-                    gpsOffsetInitialized = true;
-                } 
-            }
 
             //
             // Save data and Add consecutive node 
@@ -1195,22 +950,6 @@ void process_pg()
                 }
             }
 
-            if (isElevatorEnterTransition) {
-                elevatorEnterNodeIdx = curr_node_idx;
-                Eigen::Vector3d gravityVec;
-                if (getLatestKfGravity(gravityVec)) {
-                    const double gNorm = gravityVec.norm();
-                    if (gNorm > 1e-6) {
-                        elevatorEnterUpAxis = -gravityVec / gNorm;
-                        hasElevatorEnterUpAxis = true;
-                    } else {
-                        hasElevatorEnterUpAxis = false;
-                    }
-                } else {
-                    hasElevatorEnterUpAxis = false;
-                }
-            }
-
             if( ! gtSAMgraphMade /* prior node */) {
                 const int init_node_idx = 0; 
                 gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(pose_curr_snapshot);
@@ -1238,49 +977,6 @@ void process_pg()
                     const auto odomFactorNoise = elevatorSceneThisFrame ? degenerateNoise : odomNoise;
                     gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomFactorNoise));
 
-                    if (useTrackedFloorHeightFactorInElevator && isElevatorExitTransition && elevatorEnterNodeIdx >= 0) {
-                        Eigen::Vector3d upAxis;
-                        bool hasUpAxis = false;
-                        if (hasElevatorEnterUpAxis) {
-                            upAxis = elevatorEnterUpAxis;
-                            hasUpAxis = true;
-                        } else {
-                            Eigen::Vector3d gravityVec;
-                            if (getLatestKfGravity(gravityVec)) {
-                                const double gNorm = gravityVec.norm();
-                                if (gNorm > 1e-6) {
-                                    upAxis = -gravityVec / gNorm;
-                                    hasUpAxis = true;
-                                }
-                            }
-                        }
-
-                        if (hasUpAxis) {
-                            const int floorDelta = elevatorTargetFloor - elevatorCurrentFloor;
-                            const double targetHeightDelta = elevatorFloorHeight * static_cast<double>(floorDelta);
-                            gtSAMgraph.add(std::shared_ptr<GravityAxisHeightDifferenceFactor>(
-                                new GravityAxisHeightDifferenceFactor(elevatorEnterNodeIdx,
-                                                                      curr_node_idx,
-                                                                      upAxis,
-                                                                      targetHeightDelta,
-                                                                      floorHeightNoise)));
-                            cout << "Elevator height-delta factor added between nodes "
-                                 << elevatorEnterNodeIdx << " and " << curr_node_idx
-                                 << ", floor from " << elevatorCurrentFloor
-                                 << " to " << elevatorTargetFloor
-                                 << ", target delta = " << targetHeightDelta << endl;
-                        }
-                    }
-
-                    // gps factor 
-                    if(hasGPSforThisKF) {
-                        double curr_altitude_offseted = currGPS->altitude - gpsAltitudeInitOffset;
-                        mtxRecentPose.lock();
-                        gtsam::Point3 gpsConstraint(recentOptimizedX, recentOptimizedY, curr_altitude_offseted); // in this example, only adjusting altitude (for x and y, very big noises are set) 
-                        mtxRecentPose.unlock();
-                        gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, robustGPSNoise));
-                        cout << "GPS factor added at node " << curr_node_idx << endl;
-                    }
                     initialEstimate.insert(curr_node_idx, poseTo);                
                     // runISAM2opt();
                 }
@@ -1290,10 +986,6 @@ void process_pg()
                     cout << "posegraph odom node " << curr_node_idx << " added." << endl;
             }
 
-            if (isElevatorExitTransition) {
-                elevatorEnterNodeIdx = -1;
-                hasElevatorEnterUpAxis = false;
-            }
             prevKeyframeElevatorScene = elevatorSceneThisFrame;
             hasPrevKeyframeElevatorScene = true;
 
@@ -1395,21 +1087,34 @@ void performSCLoopClosure(void)
         cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx 
                  << " (time interval: " << time_interval << "s)" << endl;
         if (curr_node_idx - prev_node_idx > 50) {
-            bool differentSession = true;
-            mKF.lock();
-            if (prev_node_idx >= 0 && prev_node_idx < int(keyframeSessions.size()) &&
-                curr_node_idx >= 0 && curr_node_idx < int(keyframeSessions.size())) {
-                differentSession = (keyframeSessions.at(prev_node_idx) != keyframeSessions.at(curr_node_idx));
+            bool sameSession = false;
+            bool positionIsClose = false;
+            {
+                std::lock_guard<std::mutex> lock(mKF);
+                if (prev_node_idx >= 0 && prev_node_idx < int(keyframeSessions.size()) &&
+                    curr_node_idx >= 0 && curr_node_idx < int(keyframeSessions.size()) &&
+                    prev_node_idx < int(keyframePosesUpdated.size()) &&
+                    curr_node_idx < int(keyframePosesUpdated.size())) {
+                    sameSession = (keyframeSessions.at(prev_node_idx) == keyframeSessions.at(curr_node_idx));
+                    if (sameSession) {
+                        const Pose6D& prevPose = keyframePosesUpdated.at(prev_node_idx);
+                        const Pose6D& currPose = keyframePosesUpdated.at(curr_node_idx);
+                        const double dx = currPose.x - prevPose.x;
+                        const double dy = currPose.y - prevPose.y;
+                        const double dz = currPose.z - prevPose.z;
+                        const double positionDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        positionIsClose = (positionDistance <= sameSessionLoopPositionThreshold);
+                    }
+                }
             }
-            mKF.unlock();
 
-            if (differentSession) {
+            if (!sameSession || positionIsClose) {
                 mBuf.lock();
                 scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx));
                 // adding actual 6D constraints in the other thread, icp_calculation.
                 mBuf.unlock();
             } else {
-                cout << "Skip loop: same session between " << prev_node_idx << " and " << curr_node_idx << endl;
+                cout << "Skip loop: same session but position too far between " << prev_node_idx << " and " << curr_node_idx << endl;
             }
         }
         else {
@@ -1452,19 +1157,6 @@ void process_icp(void)
 
             const int prev_node_idx = loop_idx_pair.first;
             const int curr_node_idx = loop_idx_pair.second;
-            // Double-check sessions differ before expensive ICP
-            {
-                bool differentSession = true;
-                std::lock_guard<std::mutex> lock(mKF);
-                if (prev_node_idx >= 0 && prev_node_idx < int(keyframeSessions.size()) &&
-                    curr_node_idx >= 0 && curr_node_idx < int(keyframeSessions.size())) {
-                    differentSession = (keyframeSessions.at(prev_node_idx) != keyframeSessions.at(curr_node_idx));
-                }
-                if (!differentSession) {
-                    cout << "Process ICP: skip candidate because same session " << prev_node_idx << " " << curr_node_idx << endl;
-                    continue;
-                }
-            }
             auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
             if(relative_pose_optional) {
                 const LoopIcpResult& loopIcp = relative_pose_optional.value();
@@ -1487,27 +1179,27 @@ void process_icp(void)
                 }
 
                 if (loopTimePairSaveStream.is_open()) {
-                    constexpr int kLoopLogFieldWidth = 12;
                     const gtsam::Matrix4 relativePoseMat = relative_pose.matrix();
-                    loopTimePairSaveStream << std::setw(kLoopLogFieldWidth) << prev_node_idx
-                                           << std::setw(kLoopLogFieldWidth) << curr_node_idx
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(1) << prev_node_time_relative
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(1) << curr_node_time_relative
-                                           << std::setw(kLoopLogFieldWidth) << std::defaultfloat << std::setprecision(6) << loopIcp.fitness_score
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(0, 0)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(0, 1)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(0, 2)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(0, 3)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(1, 0)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(1, 1)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(1, 2)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(1, 3)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(2, 0)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(2, 1)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(2, 2)
-                                           << std::setw(kLoopLogFieldWidth) << std::fixed << std::setprecision(9) << relativePoseMat(2, 3)
+                    loopTimePairSaveStream << prev_node_idx << ' '
+                                           << curr_node_idx << ' '
+                                           << std::fixed << std::setprecision(1) << prev_node_time_relative << ' '
+                                           << std::fixed << std::setprecision(1) << curr_node_time_relative << ' '
+                                           << std::defaultfloat << std::setprecision(6) << loopIcp.fitness_score << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(0, 0) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(0, 1) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(0, 2) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(0, 3) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(1, 0) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(1, 1) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(1, 2) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(1, 3) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(2, 0) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(2, 1) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(2, 2) << ' '
+                                           << std::fixed << std::setprecision(9) << relativePoseMat(2, 3)
                                            << std::endl;
                 }
+
             } 
         }
 
@@ -1542,6 +1234,10 @@ void process_isam(void)
             if (hasPendingUpdates) {
                 runISAM2opt();
                 cout << "running isam2 optimization ..." << endl;
+
+                // save full factor graph as DOT file for visualization
+                const std::string dotPath = save_directory + "factor_graph.dot";
+                isam->getFactorsUnsafe().saveGraph(dotPath, isamCurrentEstimate);
             }
             mtxPosegraph.unlock();
 
@@ -1707,6 +1403,11 @@ int main(int argc, char **argv)
     pgLoopCloudDirectory = save_directory + "LoopClouds/";
     unused = system((std::string("exec rm -r ") + pgLoopCloudDirectory).c_str());
     unused = system((std::string("mkdir -p ") + pgLoopCloudDirectory).c_str());
+    loopCloudFitnessSaveStream = std::fstream(pgLoopCloudDirectory + "loop_cloud_fitness_scores.txt", std::fstream::out);
+    loopCloudFitnessSaveStream.precision(std::numeric_limits<double>::max_digits10);
+    if (loopCloudFitnessSaveStream.is_open()) {
+        loopCloudFitnessSaveStream << "# prev_idx curr_idx fitness_score" << std::endl;
+    }
 
 	nh.param<double>("keyframe_meter_gap", keyframeMeterGap, 1.0); // pose assignment every k m move 
 	nh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot 
@@ -1715,39 +1416,11 @@ int main(int argc, char **argv)
 	nh.param<double>("sc_dist_thres", scDistThres, 0.2);  
 	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
     nh.param<double>("loop_fitness_score_threshold", loopFitnessScoreThreshold, 0.3);
+    nh.param<double>("same_session_loop_position_thres", sameSessionLoopPositionThreshold, 2.0);
     nh.param<double>("icp_trimmed_overlap_ratio", icpTrimmedOverlapRatio, 0.8);
     nh.param<bool>("use_kf_gravity_align_for_sc", useKfGravityAlignForSC, true);
     nh.param<std::string>("kf_gravity_topic", kfGravityTopic, std::string("/kf_gravity"));
     nh.param<std::string>("elevator_scene_topic", elevatorSceneTopic, std::string("/lio/elevator_scene"));
-    nh.param<bool>("enable_non_elevator_floor_height_tracking", enableNonElevatorFloorHeightTracking, false);
-    nh.param<double>("non_elevator_floor_height_alpha", nonElevatorFloorHeightAlpha, 0.1);
-    nh.param<bool>("use_tracked_floor_height_factor_in_elevator", useTrackedFloorHeightFactorInElevator, false);
-    nh.param<double>("floor_height_factor_sigma", floorHeightFactorSigma, 0.2);
-    nh.param<double>("elevator_floor_height", elevatorFloorHeight, 3.0);
-    // Backward compatibility: use elevator_floor_count to fill missing floor IDs.
-    nh.param<int>("elevator_floor_count", elevatorFloorCount, 1);
-    const bool hasElevatorCurrentFloorParam = nh.getParam("elevator_current_floor", elevatorCurrentFloor);
-    const bool hasElevatorTargetFloorParam = nh.getParam("elevator_target_floor", elevatorTargetFloor);
-    const bool hasBothFloorParams = hasElevatorCurrentFloorParam && hasElevatorTargetFloorParam;
-    if (!hasElevatorCurrentFloorParam) {
-        elevatorCurrentFloor = 0;
-    }
-    if (!hasElevatorTargetFloorParam) {
-        elevatorTargetFloor = elevatorCurrentFloor + elevatorFloorCount;
-    }
-    if (!hasBothFloorParams) {
-        // Require both floor IDs to enable this factor. Otherwise disable to avoid ambiguous sign/magnitude.
-        useTrackedFloorHeightFactorInElevator = false;
-        ROS_WARN_STREAM("[SC-PGO] elevator_current_floor and elevator_target_floor must both be provided. "
-                        "Floor-height factor is disabled.");
-    }
-    nonElevatorFloorHeightAlpha = std::max(0.0, std::min(1.0, nonElevatorFloorHeightAlpha));
-    floorHeightFactorSigma = std::max(1e-4, floorHeightFactorSigma);
-    ROS_INFO_STREAM("[SC-PGO] Elevator floor config: height=" << elevatorFloorHeight
-                    << ", current=" << elevatorCurrentFloor
-                    << ", target=" << elevatorTargetFloor
-                    << ", floor_delta=" << (elevatorTargetFloor - elevatorCurrentFloor)
-                    << ", height_factor_enabled=" << (useTrackedFloorHeightFactorInElevator ? "true" : "false"));
     nh.param<bool>("save_keyframe_image_to_disk", saveKeyframeImageToDisk, false);
     nh.param<std::string>("image_topic", imageTopic, std::string("/rgb_img"));
     // Backward compatibility: allow old parameter name to override image_topic.
@@ -1776,7 +1449,6 @@ int main(int argc, char **argv)
 	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 200000, laserCloudFullResHandler);
 	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 20000, laserOdometryHandler);
     ros::Subscriber subImage = nh.subscribe<sensor_msgs::Image>(imageTopic, 200000, imageHandler);
-	ros::Subscriber subGPS = nh.subscribe<sensor_msgs::NavSatFix>("/gps/fix", 20000, gpsHandler);
     ros::Subscriber subElevatorScene = nh.subscribe<std_msgs::Bool>(elevatorSceneTopic, 20000, elevatorSceneHandler);
     ros::Subscriber subKfGravity = nh.subscribe<geometry_msgs::Vector3Stamped>(kfGravityTopic, 20000, kfGravityHandler);
 
